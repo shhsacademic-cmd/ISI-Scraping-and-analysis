@@ -130,19 +130,50 @@ class ISIReportAnalyzer:
 
     def _parse_school_list_page(self, soup: BeautifulSoup, base_url: str) -> list[SchoolEntry]:
         schools: list[SchoolEntry] = []
-        for a in soup.select("a"):
+
+        # Primary strategy: links that look like explicit "View" actions.
+        for a in soup.select("a[href]"):
             text = a.get_text(" ", strip=True)
             href = a.get("href")
-            if not href or "view" not in text.lower():
+            if not href:
+                continue
+
+            attrs_blob = " ".join(
+                [
+                    text,
+                    a.get("title", ""),
+                    a.get("aria-label", ""),
+                    " ".join(a.get("class", [])),
+                ]
+            ).lower()
+            if "view" not in attrs_blob:
                 continue
 
             school_url = self._resolve_url(base_url, href)
-            container = a.find_parent(["tr", "article", "li", "div"])
-            school_name = ""
-            if container:
-                school_name = self._extract_school_name(container, fallback=text)
-            school_name = school_name or text
+            container = a.find_parent(["tr", "article", "li", "div", "section"])
+            school_name = self._extract_school_name(container, fallback=text) if container else (text or "Unknown School")
             schools.append(SchoolEntry(name=school_name, url=school_url))
+
+        # Fallback strategy: parse URL patterns if "View" text is absent in markup.
+        if not schools:
+            logging.info("No explicit 'View' links found; falling back to school URL pattern detection")
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                lower_href = href.lower()
+                # Typical detail links often include /reports/<school-slug>/ or /school/... .
+                if not ("/reports/" in lower_href or "/school/" in lower_href):
+                    continue
+                if any(token in lower_href for token in ["?p=", "/page/", "/reports/feed", "#"]):
+                    continue
+
+                school_url = self._resolve_url(base_url, href)
+                # Skip obvious non-detail links.
+                if school_url.rstrip("/") == LISTING_URL.rstrip("/"):
+                    continue
+                label = a.get_text(" ", strip=True)
+                if not label:
+                    label = Path(urlparse(school_url).path.rstrip("/")).name.replace("-", " ").title() or "Unknown School"
+                schools.append(SchoolEntry(name=label, url=school_url))
 
         # Deduplicate in page order
         deduped: list[SchoolEntry] = []
@@ -152,8 +183,9 @@ class ISIReportAnalyzer:
                 continue
             seen.add(school.url)
             deduped.append(school)
-        return deduped
 
+        logging.info("Parsed %s school candidates from listing page", len(deduped))
+        return deduped
 
     @staticmethod
     def _resolve_url(base_url: str, href: str) -> str:
