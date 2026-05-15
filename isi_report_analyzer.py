@@ -220,13 +220,22 @@ class ISIReportAnalyzer:
 
     @staticmethod
     def _find_next_page(soup: BeautifulSoup, base_url: str) -> Optional[str]:
-        for a in soup.select("a"):
-            label = a.get_text(" ", strip=True).lower()
-            rel = " ".join(a.get("rel", [])).lower()
+        for a in soup.select("a[href]"):
+            raw_label = a.get_text(" ", strip=True)
+            label = raw_label.lower().replace(" ", "")
+            rel_tokens = [token.lower() for token in a.get("rel", [])]
             href = a.get("href")
             if not href:
                 continue
-            if "next" in label or rel == "next" or label in {">", "»"}:
+
+            # Prefer explicit semantic marker when available.
+            if "next" in rel_tokens:
+                return ISIReportAnalyzer._resolve_url(base_url, href)
+
+            # Avoid selecting "last page" controls like >> or »».
+            is_last_control = label in {">>", "»»", "last", "end"}
+            is_next_control = "next" in label or label in {">", "»", "›"}
+            if is_next_control and not is_last_control:
                 return ISIReportAnalyzer._resolve_url(base_url, href)
         return None
 
