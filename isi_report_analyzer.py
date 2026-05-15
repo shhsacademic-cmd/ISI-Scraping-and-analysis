@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -67,6 +67,22 @@ class ISIReportAnalyzer:
                 response.raise_for_status()
                 self._sleep()
                 return response
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status and 400 <= status < 500 and status != 429:
+                    raise
+                if attempt == self.max_retries:
+                    raise
+                backoff = 2 ** (attempt - 1)
+                logging.warning(
+                    "Request failed for %s on attempt %s/%s: %s. Retrying in %ss",
+                    url,
+                    attempt,
+                    self.max_retries,
+                    exc,
+                    backoff,
+                )
+                time.sleep(backoff)
             except requests.RequestException as exc:
                 if attempt == self.max_retries:
                     raise
@@ -120,7 +136,7 @@ class ISIReportAnalyzer:
             if not href or "view" not in text.lower():
                 continue
 
-            school_url = urljoin(base_url, href)
+            school_url = self._resolve_url(base_url, href)
             container = a.find_parent(["tr", "article", "li", "div"])
             school_name = ""
             if container:
@@ -137,6 +153,25 @@ class ISIReportAnalyzer:
             seen.add(school.url)
             deduped.append(school)
         return deduped
+
+
+    @staticmethod
+    def _resolve_url(base_url: str, href: str) -> str:
+        """Resolve href robustly against ISI pages that sometimes emit path-like relatives."""
+        href = (href or "").strip()
+        if href.startswith(("http://", "https://")):
+            return href
+
+        parsed_base = urlparse(base_url)
+        site_root = urlunparse((parsed_base.scheme, parsed_base.netloc, "/", "", "", ""))
+
+        if href.startswith("/"):
+            return urljoin(site_root, href)
+
+        if href.startswith("reports/") or href.startswith("school/"):
+            return urljoin(site_root, href)
+
+        return urljoin(base_url, href)
 
     @staticmethod
     def _extract_school_name(container, fallback: str) -> str:
@@ -160,7 +195,7 @@ class ISIReportAnalyzer:
             if not href:
                 continue
             if "next" in label or rel == "next" or label in {">", "»"}:
-                return urljoin(base_url, href)
+                return ISIReportAnalyzer._resolve_url(base_url, href)
         return None
 
     def find_latest_report(self, school_url: str) -> Optional[ReportCandidate]:
@@ -174,7 +209,7 @@ class ISIReportAnalyzer:
             if "report" not in lower_blob and not href.lower().endswith(".pdf"):
                 continue
 
-            full_url = urljoin(school_url, href)
+            full_url = self._resolve_url(school_url, href)
             label = text or Path(urlparse(full_url).path).name
             parsed_date = self._extract_date_tuple(label) or self._extract_date_tuple(full_url)
             candidates.append(ReportCandidate(report_url=full_url, label=label, parsed_date=parsed_date))
