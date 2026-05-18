@@ -1,0 +1,144 @@
+diff --git a/isi_report_analyzer.py b/isi_report_analyzer.py
+index f12a03ef728a34cb79e3b801d6d658d10d214100..747e3555e2e1576cddd2d7582ee55500eed74f73 100644
+--- a/isi_report_analyzer.py
++++ b/isi_report_analyzer.py
+@@ -218,75 +218,137 @@ class ISIReportAnalyzer:
+         text = re.sub(r"\bview\b", "", text, flags=re.IGNORECASE).strip(" -:\n\t")
+         return text or fallback
+ 
+     @staticmethod
+     def _find_next_page(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+         for a in soup.select("a[href]"):
+             raw_label = a.get_text(" ", strip=True)
+             label = raw_label.lower().replace(" ", "")
+             rel_tokens = [token.lower() for token in a.get("rel", [])]
+             href = a.get("href")
+             if not href:
+                 continue
+ 
+             # Prefer explicit semantic marker when available.
+             if "next" in rel_tokens:
+                 return ISIReportAnalyzer._resolve_url(base_url, href)
+ 
+             # Avoid selecting "last page" controls like >> or »».
+             is_last_control = label in {">>", "»»", "last", "end"}
+             is_next_control = "next" in label or label in {">", "»", "›"}
+             if is_next_control and not is_last_control:
+                 return ISIReportAnalyzer._resolve_url(base_url, href)
+         return None
+ 
+     def find_latest_report(self, school_url: str) -> Optional[ReportCandidate]:
+-        soup = BeautifulSoup(self.fetch_url(school_url).text, "html.parser")
++        last_error: Optional[Exception] = None
++        soup: Optional[BeautifulSoup] = None
++        final_school_url = school_url
++
++        for candidate_url in self._candidate_school_urls(school_url):
++            try:
++                soup = BeautifulSoup(self.fetch_url(candidate_url).text, "html.parser")
++                final_school_url = candidate_url
++                if candidate_url != school_url:
++                    logging.info("Resolved school URL fallback: %s -> %s", school_url, candidate_url)
++                break
++            except requests.HTTPError as exc:
++                status = exc.response.status_code if exc.response is not None else None
++                if status == 404:
++                    last_error = exc
++                    continue
++                raise
++
++        if soup is None:
++            if last_error is not None:
++                raise last_error
++            raise RuntimeError(f"Unable to fetch school page: {school_url}")
++
+         candidates: list[ReportCandidate] = []
+ 
+         for a in soup.select("a[href]"):
+             href = a.get("href", "")
+             text = a.get_text(" ", strip=True)
+             lower_blob = f"{href} {text}".lower()
+             if "report" not in lower_blob and not href.lower().endswith(".pdf"):
+                 continue
+ 
+-            full_url = self._resolve_url(school_url, href)
++            full_url = self._resolve_url(final_school_url, href)
+             label = text or Path(urlparse(full_url).path).name
+             parsed_date = self._extract_date_tuple(label) or self._extract_date_tuple(full_url)
+             candidates.append(ReportCandidate(report_url=full_url, label=label, parsed_date=parsed_date))
+ 
+         if not candidates:
+             return None
+ 
+         dated = [c for c in candidates if c.parsed_date is not None]
+         if dated:
+             dated.sort(key=lambda c: c.parsed_date, reverse=True)
+             return dated[0]
+ 
+         return candidates[0]
+ 
++    @staticmethod
++    def _candidate_school_urls(school_url: str) -> list[str]:
++        parsed = urlparse(school_url)
++        base = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
++        path = parsed.path or "/"
++        query = parsed.query
++        fragment = parsed.fragment
++
++        candidates = [school_url]
++
++        # Some listing links include '/reports/' even though detail pages live at root.
++        if path.startswith("/reports/"):
++            alt_path = path[len("/reports") :]
++            alt_url = urlunparse((parsed.scheme, parsed.netloc, alt_path, "", query, fragment))
++            candidates.append(alt_url)
++
++        # Also try removing query params that can lead to dead URLs.
++        if query:
++            candidates.extend(
++                [
++                    urlunparse((parsed.scheme, parsed.netloc, path, "", "", fragment)),
++                ]
++            )
++
++        # Final guard: ensure absolute root-anchored variant is attempted.
++        root_variant = urljoin(base + "/", path.lstrip("/"))
++        if query:
++            root_variant = f"{root_variant}?{query}"
++        candidates.append(root_variant)
++
++        # Keep order while removing duplicates.
++        unique: list[str] = []
++        seen: set[str] = set()
++        for c in candidates:
++            if c in seen:
++                continue
++            seen.add(c)
++            unique.append(c)
++        return unique
++
+     @staticmethod
+     def _extract_date_tuple(value: str) -> Optional[tuple[int, int, int]]:
+         patterns = [
+             re.compile(r"(20\d{2})[-_/](\d{1,2})[-_/](\d{1,2})"),
+             re.compile(r"(\d{1,2})[-_/](\d{1,2})[-_/](20\d{2})"),
+         ]
+         for pattern in patterns:
+             match = pattern.search(value)
+             if not match:
+                 continue
+             parts = [int(p) for p in match.groups()]
+             if len(str(parts[0])) == 4:
+                 y, m, d = parts
+             else:
+                 m, d, y = parts
+             if 1 <= m <= 12 and 1 <= d <= 31:
+                 return y, m, d
+         return None
+ 
+     def download_report(self, school_slug: str, report_url: str) -> Path:
+         school_dir = self.reports_root / school_slug
+         school_dir.mkdir(parents=True, exist_ok=True)
+         filename = Path(urlparse(report_url).path).name or "report.pdf"
+         if not filename.lower().endswith(".pdf"):
+             filename = f"{filename}.pdf"
